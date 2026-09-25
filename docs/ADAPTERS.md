@@ -49,3 +49,12 @@ Hosts normally need only four hooks:
 - pre-final result: capture an evidence-bearing `outcome`.
 
 Automatic transcript ingestion is intentionally outside the contract.
+
+## First concrete adapter
+
+The implementation contract for the first real ChatGPT-to-Codex slice is
+[`docs/specs/2026-09-04-chatgpt-codex-adapter-v1.md`](specs/2026-09-04-chatgpt-codex-adapter-v1.md).
+It uses a user-controlled file transport and a single-use exact-target card so
+the product can be validated without claiming an unobserved exact-thread
+bridge. A later transport may replace the file path without changing the
+kernel packet or receipt rules.
