@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { describeDemo, initialDemoState, reduceDemo } from "../demo.js";
 
 test("stale revision is rejected before any resume", () => {
@@ -67,6 +68,6 @@ test("landing page local links and assets exist", () => {
   const refs = [...html.matchAll(/(?:href|src)="([^"]+)"/g)].map((match) => match[1]);
   for (const ref of refs) {
     if (ref.startsWith("#") || /^[a-z]+:/i.test(ref) || ref.startsWith("//")) continue;
-    assert.equal(fs.existsSync(path.resolve(path.dirname(new URL("../index.html", import.meta.url).pathname), ref)), true, `missing local reference: ${ref}`);
+    assert.equal(fs.existsSync(path.resolve(path.dirname(fileURLToPath(new URL("../index.html", import.meta.url))), ref)), true, `missing local reference: ${ref}`);
   }
 });

@@ -127,6 +127,19 @@ export function writeAll(
   }
 }
 
+/**
+ * Make a completed create/rename durable by syncing its parent directory.
+ *
+ * POSIX needs this; Windows does not allow opening a directory for fsync
+ * (EPERM) and NTFS journals the metadata change itself. Platform mechanism,
+ * not product semantics (cross-platform contract v1, §2).
+ */
+function syncDirectory(directoryPath: string) {
+  if (process.platform === "win32") return;
+  const directory = fs.openSync(directoryPath, "r");
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+}
+
 function appendJsonl(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const existed = fs.existsSync(file);
@@ -135,10 +148,7 @@ function appendJsonl(file: string, value: unknown) {
     writeAll(descriptor, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
-  if (!existed) {
-    const directory = fs.openSync(path.dirname(file), "r");
-    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
-  }
+  if (!existed) syncDirectory(path.dirname(file));
 }
 
 function isSurface(value: unknown): value is Surface {
@@ -275,8 +285,7 @@ function writeAtomic(file: string, value: unknown) {
     fs.fsyncSync(descriptor);
   } finally { fs.closeSync(descriptor); }
   fs.renameSync(temporary, file);
-  const directory = fs.openSync(path.dirname(file), "r");
-  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  syncDirectory(path.dirname(file));
 }
 
 export class TrajectaStore {
