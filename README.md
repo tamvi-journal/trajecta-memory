@@ -174,8 +174,24 @@ provider prompt, or product-specific tunnel. See [SECURITY.md](SECURITY.md).
 
 `0.1.0` is an alpha kernel: work lifecycle, cue routing, immutable contract
 anchors, bounded transfer packets, and cloud ⇄ local round-trip behavior are
-tested. Product adapters and the separately governed slow-learning layer remain
-future work.
+tested. The kernel also ships a **verified resume proof**: stale resume attempts
+are rejected with receipts, interrupted operations recover, and local resume
+envelopes are strict (`npm run proof`). Product adapters and the separately
+governed slow-learning layer remain future work.
+
+Trajecta targets macOS, Linux and Windows as equals. See the locked
+[cross-platform product contract](docs/specs/2026-09-16-cross-platform-product-contract-v1.md).
+CI runs `npm run check` on all three.
+
+## Composition
+
+Trajecta is the shared work-continuity backbone in the Tam Vị family:
+
+| Package | Question |
+|---|---|
+| `trajecta-memory` | What are we doing, what changed, where do we resume? |
+| [`trajecta-identity-memory`](https://github.com/tamvi-journal/trajecta-identity-memory) | Who is the agent (core, phases, recognition)? Points to work with `work_refs`, never copies it. |
+| [`agent-memory-core`](https://github.com/tamvi-journal/agent-memory-core) | What does the agent believe, and why (evidence, revisions)? |
 
 ## Origin
 

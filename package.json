@@ -23,7 +23,8 @@
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "demo": "node --experimental-strip-types examples/cloud-local-relay.ts",
-    "check": "npm test && npm run demo"
+    "proof": "node --experimental-strip-types examples/verified-resume-proof.ts",
+    "check": "npm test && npm run demo && npm run proof"
   },
   "engines": {
     "node": ">=22.19"

@@ -17,13 +17,29 @@ interface StateFile {
   work: WorkItem[];
 }
 
-interface OperationRecord {
+interface OperationRecordLegacy {
   operationId: string;
   digest: string;
   state: "reserved" | "committed";
   deltaId?: string;
   result?: { work: WorkItem; delta: Delta };
 }
+
+interface OperationRecordV2 {
+  schema: "trajecta.operation/v2";
+  operationId: string;
+  digest: string;
+  state: "reserved" | "committed";
+  beforeStateDigest: string;
+  nextStateDigest: string;
+  delta: Delta;
+  nextState: StateFile;
+  result: { work: WorkItem; delta: Delta };
+}
+
+type OperationRecord = OperationRecordLegacy | OperationRecordV2;
+
+export type StoreFaultPoint = "after-reserve" | "after-delta" | "after-state";
 
 export class RevisionConflict extends Error {
   readonly latest: WorkItem;
@@ -38,6 +54,13 @@ export class OperationConflict extends Error {
   constructor() {
     super("Operation ID was reused with different input");
     this.name = "OperationConflict";
+  }
+}
+
+export class OperationInDoubt extends Error {
+  constructor() {
+    super("Operation outcome is ambiguous; inspect durable state before retrying");
+    this.name = "OperationInDoubt";
   }
 }
 
@@ -58,7 +81,31 @@ function assertSurface(surface: Surface) {
   assertText(surface.session, "Surface session", 200);
 }
 
-function digest(value: unknown) {
+function canonicalStoreJson(value: unknown, stack = new Set<object>()): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalStoreJson(item, stack)).join(",")}]`;
+  if (typeof value !== "object") throw new TypeError("Store digest accepts JSON values only");
+  if (stack.has(value)) throw new TypeError("Store digest cannot serialize cyclic values");
+  stack.add(value);
+  try {
+    const entries = Object.keys(value).sort().flatMap((key) => {
+      const item = (value as Record<string, unknown>)[key];
+      if (item === undefined || typeof item === "function" || typeof item === "symbol") return [];
+      return [`${JSON.stringify(key)}:${canonicalStoreJson(item, stack)}`];
+    });
+    return `{${entries.join(",")}}`;
+  } finally {
+    stack.delete(value);
+  }
+}
+
+export function canonicalStoreDigest(value: unknown) {
+  return crypto.createHash("sha256").update(canonicalStoreJson(value)).digest("hex");
+}
+
+function legacyStoreDigest(value: unknown) {
   return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
@@ -66,21 +113,170 @@ function tokenize(value: string) {
   return [...new Set(value.toLocaleLowerCase().normalize("NFKD").replace(/[^\p{L}\p{N}]+/gu, " ").trim().split(/\s+/).filter((token) => token.length > 1))];
 }
 
-function appendJsonl(file: string, value: unknown) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+export function writeAll(
+  descriptor: number,
+  bytes: Buffer,
+  writer: (descriptor: number, bytes: Buffer, offset: number, length: number) => number = fs.writeSync,
+  noProgressMessage = "Operation log write made no progress",
+) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writer(descriptor, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error(noProgressMessage);
+    offset += written;
+  }
 }
 
-function readJsonl<T>(file: string): T[] {
+function appendJsonl(file: string, value: unknown) {
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const existed = fs.existsSync(file);
+  const descriptor = fs.openSync(file, "a", 0o600);
+  try {
+    writeAll(descriptor, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
+  if (!existed) {
+    const directory = fs.openSync(path.dirname(file), "r");
+    try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+  }
+}
+
+function isSurface(value: unknown): value is Surface {
+  const surface = value as Partial<Surface> | null;
+  return Boolean(surface)
+    && (surface.kind === "cloud" || surface.kind === "local")
+    && typeof surface.name === "string"
+    && typeof surface.session === "string";
+}
+
+function isDelta(value: unknown): value is Delta {
+  const delta = value as Partial<Delta> | null;
+  return Boolean(delta)
+    && typeof delta.id === "string"
+    && typeof delta.operationId === "string"
+    && typeof delta.workId === "string"
+    && Number.isInteger(delta.revision) && delta.revision > 0
+    && ["instruction", "decision", "progress", "blocker", "correction", "next_action", "branch_open", "branch_park", "synthesis", "handoff", "outcome", "contract_anchor", "open", "resume"].includes(delta.kind as string)
+    && typeof delta.summary === "string"
+    && isSurface(delta.surface)
+    && (typeof delta.branchId === "string" || delta.branchId === null)
+    && (delta.targetSurface === "cloud" || delta.targetSurface === "local" || delta.targetSurface === null)
+    && Array.isArray(delta.provenance) && delta.provenance.every((item) => typeof item === "string")
+    && typeof delta.createdAt === "string"
+    && (delta.contractVersion === undefined || (Number.isInteger(delta.contractVersion) && delta.contractVersion > 0))
+    && (delta.previousContractId === undefined || typeof delta.previousContractId === "string" || delta.previousContractId === null);
+}
+
+function isBranch(value: unknown): value is Branch {
+  const branch = value as Partial<Branch> | null;
+  return Boolean(branch)
+    && typeof branch.id === "string"
+    && typeof branch.label === "string"
+    && typeof branch.purpose === "string"
+    && Array.isArray(branch.cues) && branch.cues.every((item) => typeof item === "string")
+    && typeof branch.returnPoint === "string"
+    && ["exploring", "parked", "merged"].includes(branch.status as string)
+    && typeof branch.updatedAt === "string";
+}
+
+function isWorkItem(value: unknown): value is WorkItem {
+  const work = value as Partial<WorkItem> | null;
+  return Boolean(work)
+    && typeof work.id === "string"
+    && typeof work.topic === "string"
+    && typeof work.goal === "string"
+    && (typeof work.instruction === "string" || work.instruction === null)
+    && ["active", "waiting", "blocked", "complete", "abandoned"].includes(work.status as string)
+    && Number.isInteger(work.revision) && work.revision > 0
+    && (typeof work.activeBranchId === "string" || work.activeBranchId === null)
+    && Array.isArray(work.branches) && work.branches.every(isBranch)
+    && Array.isArray(work.openLoops)
+    && work.openLoops.every((item) => typeof item === "string")
+    && (typeof work.nextAction === "string" || work.nextAction === null)
+    && isSurface(work.lastSurface)
+    && typeof work.createdAt === "string"
+    && typeof work.updatedAt === "string";
+}
+
+function isStateFile(value: unknown): value is StateFile {
+  const state = value as Partial<StateFile> | null;
+  return Boolean(state) && state.schema === "trajecta.state/v1" && Array.isArray(state.work) && state.work.every(isWorkItem);
+}
+
+function isDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isOperationRecordLegacy(value: unknown): value is OperationRecordLegacy {
+  const record = value as Partial<OperationRecordLegacy> | null;
+  return Boolean(record)
+    && !("schema" in record)
+    && typeof record.operationId === "string"
+    && isDigest(record.digest)
+    && (record.state === "reserved" || record.state === "committed")
+    && (record.deltaId === undefined || typeof record.deltaId === "string")
+    && (record.result === undefined || (isWorkItem(record.result.work) && isDelta(record.result.delta)));
+}
+
+function isOperationRecordV2(value: unknown): value is OperationRecordV2 {
+  const record = value as Partial<OperationRecordV2> | null;
+  if (!(Boolean(record)
+    && record.schema === "trajecta.operation/v2"
+    && typeof record.operationId === "string"
+    && isDigest(record.digest)
+    && (record.state === "reserved" || record.state === "committed")
+    && isDigest(record.beforeStateDigest)
+    && isDigest(record.nextStateDigest)
+    && isDelta(record.delta)
+    && isStateFile(record.nextState)
+    && Boolean(record.result) && isWorkItem(record.result.work) && isDelta(record.result.delta)
+  )) return false;
+  const nextWork = record.nextState.work.filter((work) => work.id === record.delta.workId);
+  return record.delta.operationId === record.operationId
+    && record.result.delta.operationId === record.operationId
+    && record.result.work.id === record.delta.workId
+    && record.result.work.revision === record.delta.revision
+    && nextWork.length === 1
+    && record.nextStateDigest === canonicalStoreDigest(record.nextState)
+    && canonicalStoreDigest(record.delta) === canonicalStoreDigest(record.result.delta)
+    && canonicalStoreDigest(record.result.work) === canonicalStoreDigest(nextWork[0]);
+}
+
+function readJsonl<T>(file: string, role: "operations" | "deltas"): T[] {
   if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as T);
+  let content: string;
+  try {
+    content = fs.readFileSync(file, "utf8");
+  } catch {
+    throw new OperationInDoubt();
+  }
+  if (!content) return [];
+  if (!content.endsWith("\n")) throw new OperationInDoubt();
+  try {
+    return content.slice(0, -1).split("\n").map((line) => {
+      const value: unknown = JSON.parse(line);
+      if (role === "operations" ? !(isOperationRecordLegacy(value) || isOperationRecordV2(value)) : !isDelta(value)) {
+        throw new OperationInDoubt();
+      }
+      return value as T;
+    });
+  } catch (error) {
+    if (error instanceof OperationInDoubt) throw error;
+    throw new OperationInDoubt();
+  }
 }
 
 function writeAtomic(file: string, value: unknown) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+  const descriptor = fs.openSync(temporary, "wx", 0o600);
+  try {
+    writeAll(descriptor, Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8"), fs.writeSync, "Atomic file write made no progress");
+    fs.fsyncSync(descriptor);
+  } finally { fs.closeSync(descriptor); }
   fs.renameSync(temporary, file);
+  const directory = fs.openSync(path.dirname(file), "r");
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
 }
 
 export class TrajectaStore {
@@ -89,40 +285,96 @@ export class TrajectaStore {
   private readonly deltaFile: string;
   private readonly operationFile: string;
   private readonly clock: () => Date;
+  private readonly fault?: (point: StoreFaultPoint) => void;
 
-  constructor(root = path.resolve(".trajecta"), clock: () => Date = () => new Date()) {
+  constructor(root = path.resolve(".trajecta"), clock: () => Date = () => new Date(), fault?: (point: StoreFaultPoint) => void) {
     this.root = root;
     this.stateFile = path.join(root, "state.json");
     this.deltaFile = path.join(root, "deltas.jsonl");
     this.operationFile = path.join(root, "operations.jsonl");
     this.clock = clock;
+    this.fault = fault;
   }
 
   private readState(): StateFile {
     if (!fs.existsSync(this.stateFile)) return { schema: "trajecta.state/v1", work: [] };
-    const value = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
-    if (value?.schema !== "trajecta.state/v1" || !Array.isArray(value.work)) throw new Error("Trajecta state is corrupt");
-    return value;
+    try {
+      const value: unknown = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
+      if (!isStateFile(value)) throw new OperationInDoubt();
+      return value;
+    } catch (error) {
+      if (error instanceof OperationInDoubt) throw error;
+      throw new OperationInDoubt();
+    }
   }
 
-  private commit(state: StateFile, delta: Delta, input: unknown) {
-    const inputDigest = digest(input);
-    appendJsonl(this.operationFile, { operationId: delta.operationId, digest: inputDigest, state: "reserved" });
+  private commit(beforeState: StateFile, state: StateFile, delta: Delta, input: unknown) {
+    const result = {
+      work: structuredClone(state.work.find((item) => item.id === delta.workId)!),
+      delta: structuredClone(delta),
+    };
+    const reservation: OperationRecordV2 = {
+      schema: "trajecta.operation/v2",
+      operationId: delta.operationId,
+      digest: canonicalStoreDigest(input),
+      state: "reserved",
+      beforeStateDigest: canonicalStoreDigest(beforeState),
+      nextStateDigest: canonicalStoreDigest(state),
+      delta: structuredClone(delta),
+      nextState: structuredClone(state),
+      result: structuredClone(result),
+    };
+    appendJsonl(this.operationFile, reservation);
+    this.fault?.("after-reserve");
     appendJsonl(this.deltaFile, delta);
+    this.fault?.("after-delta");
     writeAtomic(this.stateFile, state);
-    const result = { work: structuredClone(state.work.find((item) => item.id === delta.workId)!), delta };
-    appendJsonl(this.operationFile, { operationId: delta.operationId, digest: inputDigest, state: "committed", deltaId: delta.id, result });
-    return result;
+    this.fault?.("after-state");
+    appendJsonl(this.operationFile, { ...reservation, state: "committed" });
+    return structuredClone(result);
   }
 
   private replay(operationId: string, input: unknown) {
     assertId(operationId, "Operation ID");
-    const matching = readJsonl<OperationRecord>(this.operationFile).filter((item) => item.operationId === operationId);
+    const matching = readJsonl<OperationRecord>(this.operationFile, "operations").filter((item) => item.operationId === operationId);
     if (!matching.length) return null;
-    if (matching.some((item) => item.digest !== digest(input))) throw new OperationConflict();
-    const committed = [...matching].reverse().find((item) => item.state === "committed");
-    if (!committed?.result) throw new Error("Operation is reserved without a committed outcome; inspect state before retrying");
-    return structuredClone(committed.result);
+    const allLegacy = matching.every((item) => !("schema" in item));
+    const allV2 = matching.every((item) => "schema" in item);
+    if (!allLegacy && !allV2) throw new OperationInDoubt();
+    const inputDigest = allLegacy ? legacyStoreDigest(input) : canonicalStoreDigest(input);
+    if (matching.some((item) => item.digest !== inputDigest)) throw new OperationConflict();
+    if (allLegacy) {
+      const committed = [...matching].reverse().find((item) => item.state === "committed");
+      if (!committed?.result) throw new OperationInDoubt();
+      return structuredClone(committed.result);
+    }
+    const records = matching as OperationRecordV2[];
+    const reservations = records.filter((record) => record.state === "reserved");
+    const committed = records.filter((record) => record.state === "committed");
+    if (reservations.length !== 1 || committed.length > 1) throw new OperationInDoubt();
+    const reservation = reservations[0];
+    if (committed.length) {
+      const final = committed[0];
+      const { state: _reservedState, ...reservedBody } = reservation;
+      const { state: _committedState, ...committedBody } = final;
+      if (canonicalStoreDigest(reservedBody) !== canonicalStoreDigest(committedBody)) throw new OperationInDoubt();
+      return structuredClone(final.result);
+    }
+    return this.reconcileReservation(reservation);
+  }
+
+  private reconcileReservation(reservation: OperationRecordV2) {
+    const state = this.readState();
+    const currentDigest = canonicalStoreDigest(state);
+    if (currentDigest !== reservation.beforeStateDigest && currentDigest !== reservation.nextStateDigest) throw new OperationInDoubt();
+    const matchingDeltas = readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.operationId === reservation.operationId);
+    if (matchingDeltas.length > 1) throw new OperationInDoubt();
+    if (matchingDeltas.length && canonicalStoreDigest(matchingDeltas[0]) !== canonicalStoreDigest(reservation.delta)) throw new OperationInDoubt();
+    if (!matchingDeltas.length) appendJsonl(this.deltaFile, reservation.delta);
+    if (currentDigest === reservation.beforeStateDigest) writeAtomic(this.stateFile, reservation.nextState);
+    if (canonicalStoreDigest(this.readState()) !== reservation.nextStateDigest) throw new OperationInDoubt();
+    appendJsonl(this.operationFile, { ...reservation, state: "committed" });
+    return structuredClone(reservation.result);
   }
 
   open(input: OpenWorkInput) {
@@ -164,8 +416,9 @@ export class TrajectaStore {
       createdAt: now,
     };
     const state = this.readState();
+    const beforeState = structuredClone(state);
     state.work.push(work);
-    return this.commit(state, delta, input);
+    return this.commit(beforeState, state, delta, input);
   }
 
   capture(input: CaptureDeltaInput) {
@@ -174,6 +427,7 @@ export class TrajectaStore {
     assertText(input.summary, "Delta summary", input.kind === "contract_anchor" ? 8_000 : 1_000);
     assertSurface(input.surface);
     const state = this.readState();
+    const beforeState = structuredClone(state);
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
@@ -210,7 +464,7 @@ export class TrajectaStore {
     next.updatedAt = now;
     next.lastSurface = structuredClone(input.surface);
 
-    const allDeltas = readJsonl<Delta>(this.deltaFile);
+    const allDeltas = readJsonl<Delta>(this.deltaFile, "deltas");
     const anchors = allDeltas.filter((item) => item.workId === input.workId && item.kind === "contract_anchor");
     const previousAnchor = anchors.at(-1);
     if (input.kind === "contract_anchor" && previousAnchor && !input.provenance?.includes(previousAnchor.id)) {
@@ -234,7 +488,7 @@ export class TrajectaStore {
       } : {}),
     };
     state.work[index] = next;
-    return this.commit(state, delta, input);
+    return this.commit(beforeState, state, delta, input);
   }
 
   resume(input: { operationId: string; workId: string; expectedRevision: number; surface: Surface; instruction?: string }) {
@@ -242,6 +496,7 @@ export class TrajectaStore {
     if (replay) return replay;
     assertSurface(input.surface);
     const state = this.readState();
+    const beforeState = structuredClone(state);
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
@@ -268,7 +523,7 @@ export class TrajectaStore {
       createdAt: now,
     };
     state.work[index] = next;
-    return this.commit(state, delta, input);
+    return this.commit(beforeState, state, delta, input);
   }
 
   route(cue: string, limit = 3): RouteMatch[] {
@@ -292,9 +547,9 @@ export class TrajectaStore {
     if (maxBytes < 900) throw new Error("Transfer budget must be at least 900 bytes");
     const work = this.getWork(workId);
     const activeBranch = work.branches.find((branch) => branch.id === work.activeBranchId) ?? null;
-    const deltas = readJsonl<Delta>(this.deltaFile).filter((item) => item.workId === workId && item.kind !== "contract_anchor");
+    const deltas = readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.kind !== "contract_anchor");
     const latestAnchor = includeContract
-      ? readJsonl<Delta>(this.deltaFile).filter((item) => item.workId === workId && item.kind === "contract_anchor").at(-1)
+      ? readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.kind === "contract_anchor").at(-1)
       : undefined;
     const packetBase = {
       schema: "trajecta.transfer/v1" as const,
@@ -358,7 +613,7 @@ export class TrajectaStore {
 
   history(workId: string) {
     this.getWork(workId);
-    return readJsonl<Delta>(this.deltaFile).filter((item) => item.workId === workId);
+    return readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId);
   }
 
   private makeBranch(input: { label: string; purpose: string; cues: string[]; returnPoint: string }, now: string): Branch {

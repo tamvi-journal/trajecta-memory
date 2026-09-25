@@ -1,0 +1,11 @@
+{
+  "schema": "trajecta.comparator-observation/v1",
+  "source": "authenticated-customer0-observation",
+  "observed_on": "2026-09-04",
+  "query": "Should the team launch paid ads now?",
+  "candidates": [
+    { "summary": "launch_paid_ads_immediately", "is_latest": true, "rank": 1 },
+    { "summary": "do_not_buy_paid_ads_before_proof", "is_latest": true, "rank": 2 }
+  ],
+  "claim_boundary": "One bounded fixture; not a claim about every competitor workflow."
+}
