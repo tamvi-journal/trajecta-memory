@@ -56,11 +56,42 @@ task.”
 Trajecta is dependency-free TypeScript running directly on Node 22.19+.
 
 ```bash
-git clone https://github.com/tamvi-journal/trajecta-memory.git
-cd trajecta-memory
+git clone https://github.com/tamvi-journal/trajecta-work-memory.git
+cd trajecta-work-memory
 npm test
 npm run demo
 ```
+
+## MCP server
+
+Agents can use work memory directly through a stdio MCP server, with no
+dependencies:
+
+```json
+{
+  "mcpServers": {
+    "trajecta-work": {
+      "command": "node",
+      "args": ["--experimental-strip-types", "/path/to/trajecta-work-memory/src/mcp-server.ts"],
+      "env": { "TRAJECTA_SURFACE_KIND": "cloud", "TRAJECTA_SURFACE_NAME": "Claude" }
+    }
+  }
+}
+```
+
+Tools: `work_list`, `work_route`, `work_get`, `work_open`, `work_capture`,
+`work_handoff`, `work_resume`, `work_packet`. Every write carries the expected
+revision. A stale one is rejected, and the error says which revision to retry
+with.
+
+The store lives in `TRAJECTA_HOME`, or in the platform data folder by default
+(`~/Library/Application Support/Trajecta Work Memory` on macOS,
+`%LOCALAPPDATA%\Trajecta Work Memory` on Windows,
+`~/.local/share/trajecta-work-memory` on Linux). It is single-writer, so run one
+server per store.
+
+[`trajecta-identity-memory`](https://github.com/tamvi-journal/trajecta-identity-memory)
+reads the same store (read-only) when `TRAJECTA_WORK_ROOT` points to it.
 
 ## Product page
 
@@ -73,7 +104,7 @@ python3 -m http.server 4173
 Then open [http://localhost:4173/](http://localhost:4173/). The interactive handoff is an explanatory simulation of tested alpha behavior; adapters remain in validation.
 
 ```ts
-import { TrajectaRelay, TrajectaStore } from "trajecta-memory";
+import { TrajectaRelay, TrajectaStore } from "trajecta-work-memory";
 
 const memory = new TrajectaStore(".trajecta");
 const cloud = { kind: "cloud", name: "ChatGPT", session: "cloud:planning" } as const;
@@ -148,11 +179,11 @@ See [Architecture](docs/ARCHITECTURE.md) and the
 ## Not another semantic memory
 
 Trajecta intentionally has a narrower job than
-[Agent Memory Core](https://github.com/tamvi-journal/agent-memory-core):
+[Trajecta Identity Memory](https://github.com/tamvi-journal/trajecta-identity-memory):
 
-| | Trajecta | Agent Memory Core |
+| | Trajecta work memory | Trajecta identity memory |
 |---|---|---|
-| Primary question | What are we doing, what changed, and where do we resume? | What does the agent currently know or believe, and why? |
+| Primary question | What are we doing, what changed, and where do we resume? | Who is the agent, and what does it believe about itself, and why? |
 | Unit | Work delta, branch, transfer packet | Semantic record, evidence, revision |
 | Fast path | Cross-surface task continuity | Cue/graph semantic recall |
 | History | Work and contract chronology | Belief and evidence chronology |
@@ -189,9 +220,8 @@ Trajecta is the shared work-continuity backbone in the Tam Vị family:
 
 | Package | Question |
 |---|---|
-| `trajecta-memory` | What are we doing, what changed, where do we resume? |
+| `trajecta-work-memory` | What are we doing, what changed, where do we resume? |
 | [`trajecta-identity-memory`](https://github.com/tamvi-journal/trajecta-identity-memory) | Who is the agent (core, phases, recognition)? Points to work with `work_refs`, never copies it. |
-| [`agent-memory-core`](https://github.com/tamvi-journal/agent-memory-core) | What does the agent believe, and why (evidence, revisions)? |
 
 ## Origin
 
